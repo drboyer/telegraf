@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +16,7 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/filter"
 	"github.com/influxdata/telegraf/internal"
+	"github.com/influxdata/telegraf/internal/docker"
 	tlsint "github.com/influxdata/telegraf/internal/tls"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
@@ -158,7 +162,7 @@ func (d *DockerOverlay2) Gather(acc telegraf.Accumulator) error {
 
 	containers, err := d.client.ContainerList(ctx, opts)
 	if err == context.DeadlineExceeded {
-		return errListTimeout
+		return errors.New("timeout retrieving container list")
 	}
 	if err != nil {
 		return err
@@ -182,9 +186,8 @@ func (d *DockerOverlay2) Gather(acc telegraf.Accumulator) error {
 
 func (d *DockerOverlay2) gatherContainer(
 	container types.Container,
-	acc telegraf.Accumulator
-) error {
-	var v *types.StatsJSON  // TODO: unfortunately needed?
+	acc telegraf.Accumulator) error {
+	// var v *types.StatsJSON // TODO: unfortunately needed?
 
 	// Parse container name
 	var cname string
@@ -223,12 +226,12 @@ func (d *DockerOverlay2) gatherContainer(
 	}
 
 	// TODO: set time to something else deterministic?
-	tm = time.Now()
+	tm := time.Now()
 
 	// Add whitelisted environment variables to tags
 	// TODO: we still need this, right?
 	if len(d.TagEnvironment) > 0 {
-		for _, envvar := range info.Config.Env {
+		for _, envvar := range insp.Config.Env {
 			for _, configvar := range d.TagEnvironment {
 				dockEnv := strings.SplitN(envvar, "=", 2)
 				//check for presence of tag in whitelist
@@ -240,15 +243,15 @@ func (d *DockerOverlay2) gatherContainer(
 	}
 
 	// TODO: Don't just magically pull from the map? See memstats in parseContainerStats()
-	mergedDir := containerDesc.GraphDriver.Data["MergedDir"]
+	mergedDir := insp.GraphDriver.Data["MergedDir"]
 
-	size_fields  := map[string]interface{}{
-		"container_id": container.ID,
-		"size_root_fs": container.SizeRootFs,
-		"size_container_merged": d.calcSizeOfPath(mergedDir)
+	size_fields := map[string]interface{}{
+		"container_id":          container.ID,
+		"size_root_fs":          container.SizeRootFs,
+		"size_container_merged": d.calcSizeOfPath(mergedDir),
 	}
 
-	acc.addFields("docker_container_size", size_fields, tags, tm)
+	acc.AddFields("docker_container_size", size_fields, tags, tm)
 
 	return nil
 }
@@ -272,13 +275,22 @@ func (d *DockerOverlay2) calcSizeOfPath(currPath string) int64 {
 
 	for _, file := range files {
 		if file.IsDir() {
-			size += calcSizeOfPath(fmt.Sprintf("%s/%s", currPath, file.Name()))
+			size += d.calcSizeOfPath(fmt.Sprintf("%s/%s", currPath, file.Name()))
 		} else {
 			size += file.Size()
 		}
 	}
 
 	return size
+}
+
+func (d *DockerOverlay2) createContainerFilters() error {
+	filter, err := filter.NewIncludeExcludeFilter(d.ContainerInclude, d.ContainerExclude)
+	if err != nil {
+		return err
+	}
+	d.containerFilter = filter
+	return nil
 }
 
 func (d *DockerOverlay2) createLabelFilters() error {
