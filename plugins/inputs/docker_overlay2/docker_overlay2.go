@@ -1,0 +1,328 @@
+package docker_overlay2
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/influxdata/telegraf"
+	"github.com/influxdata/telegraf/filter"
+	"github.com/influxdata/telegraf/internal"
+	tlsint "github.com/influxdata/telegraf/internal/tls"
+	"github.com/influxdata/telegraf/plugins/inputs"
+)
+
+// DockerOverlay2 object
+type DockerOverlay2 struct {
+	Endpoint string
+
+	Timeout        internal.Duration
+	TagEnvironment []string `toml:"tag_env"`
+	LabelInclude   []string `toml:"docker_label_include"`
+	LabelExclude   []string `toml:"docker_label_exclude"`
+
+	ContainerInclude []string `toml:"container_name_include"`
+	ContainerExclude []string `toml:"container_name_exclude"`
+
+	ContainerStateInclude []string `toml:"container_state_include"`
+	ContainerStateExclude []string `toml:"container_state_exclude"`
+
+	tlsint.ClientConfig
+
+	newEnvClient func() (Client, error)
+	newClient    func(string, *tls.Config) (Client, error)
+
+	client          Client
+	httpClient      *http.Client
+	engineHost      string
+	serverVersion   string
+	filtersCreated  bool
+	labelFilter     filter.Filter
+	containerFilter filter.Filter
+	stateFilter     filter.Filter
+}
+
+// TODO: human-friendly sizes?
+const (
+	defaultEndpoint = "unix:///var/run/docker.sock"
+)
+
+var (
+	// TODO: sizeRegex?
+	containerStates = []string{"created", "restarting", "running", "removing", "paused", "exited", "dead"}
+	now             = time.Now
+)
+
+var sampleConfig = `
+  ## Docker Endpoint
+  ##   To use TCP, set endpoint = "tcp://[ip]:[port]"
+  ##   To use environment variables (ie, docker-machine), set endpoint = "ENV"
+  endpoint = "unix:///var/run/docker.sock"
+
+  ## Containers to include and exclude. Globs accepted.
+  ## Note that an empty array for both will include all containers
+  container_name_include = []
+  container_name_exclude = []
+
+  ## Container states to include and exclude. Globs accepted.
+  ## When empty only containers in the "running" state will be captured.
+  ## example: container_state_include = ["created", "restarting", "running", "removing", "paused", "exited", "dead"]
+  ## example: container_state_exclude = ["created", "restarting", "running", "removing", "paused", "exited", "dead"]
+  # container_state_include = []
+  # container_state_exclude = []
+
+  ## Timeout for docker list, info, and stats commands
+  timeout = "5s"
+
+  ## Which environment variables should we use as a tag
+  ##tag_env = ["JAVA_HOME", "HEAP_SIZE"]
+
+  ## docker labels to include and exclude as tags.  Globs accepted.
+  ## Note that an empty array for both will include all labels as tags
+  docker_label_include = []
+  docker_label_exclude = []
+
+  ## Optional TLS Config
+  # tls_ca = "/etc/telegraf/ca.pem"
+  # tls_cert = "/etc/telegraf/cert.pem"
+  # tls_key = "/etc/telegraf/key.pem"
+  ## Use TLS but skip chain & host verification
+  # insecure_skip_verify = false
+`
+
+// SampleConfig returns the default DockerOverlay2 TOML configuration
+func (d *DockerOverlay2) SampleConfig() string { return sampleConfig }
+
+// Short description of the metrics returned
+func (d *DockerOverlay2) Description() string {
+	return "Metrics about docker container sizes"
+}
+
+// Gather metrics!
+func (d *DockerOverlay2) Gather(acc telegraf.Accumulator) error {
+	if d.client == nil {
+		c, err := d.getNewClient()
+		if err != nil {
+			return err
+		}
+		d.client = c
+	}
+
+	// Create label filters if not already created
+	if !d.filtersCreated {
+		err := d.createLabelFilters()
+		if err != nil {
+			return err
+		}
+		err = d.createContainerFilters()
+		if err != nil {
+			return err
+		}
+		err = d.createContainerStateFilters()
+		if err != nil {
+			return err
+		}
+		d.filtersCreated = true
+	}
+
+	// Get daemon info
+	// TODO: We don't need this, do we?
+	// err := d.gatherInfo(acc)
+	// if err != nil {
+	// 	acc.AddError(err)
+	// }
+
+	filterArgs := filters.NewArgs()
+	for _, state := range containerStates {
+		if d.stateFilter.Match(state) {
+			filterArgs.Add("status", state)
+		}
+	}
+
+	// All container states were excluded
+	if filterArgs.Len() == 0 {
+		return nil
+	}
+
+	// List containers
+	opts := types.ContainerListOptions{
+		Filters: filterArgs,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout.Duration)
+	defer cancel()
+
+	containers, err := d.client.ContainerList(ctx, opts)
+	if err == context.DeadlineExceeded {
+		return errListTimeout
+	}
+	if err != nil {
+		return err
+	}
+
+	// Get container data
+	var wg sync.WaitGroup
+	wg.Add(len(containers))
+	for _, container := range containers {
+		go func(c types.Container) {
+			defer wg.Done()
+			if err := d.gatherContainer(c, acc); err != nil {
+				acc.AddError(err)
+			}
+		}(container)
+	}
+	wg.Wait()
+
+	return nil
+}
+
+func (d *DockerOverlay2) gatherContainer(
+	container types.Container,
+	acc telegraf.Accumulator
+) error {
+	var v *types.StatsJSON  // TODO: unfortunately needed?
+
+	// Parse container name
+	var cname string
+	for _, name := range container.Names {
+		trimmedName := strings.TrimPrefix(name, "/")
+		match := d.containerFilter.Match(trimmedName)
+		if match {
+			cname = trimmedName
+			break
+		}
+	}
+
+	if cname == "" {
+		return nil
+	}
+
+	imageName, imageVersion := docker.ParseImage(container.Image)
+
+	tags := map[string]string{
+		"engine_host":       d.engineHost,
+		"server_version":    d.serverVersion,
+		"container_name":    cname,
+		"container_image":   imageName,
+		"container_version": imageVersion,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout.Duration)
+	defer cancel()
+
+	insp, err := d.client.ContainerInspect(ctx, container.ID)
+	if err == context.DeadlineExceeded {
+		return errors.New("timeout inspecting container")
+	}
+	if err != nil {
+		return fmt.Errorf("error inspecting docker container: %v", err)
+	}
+
+	// TODO: set time to something else deterministic?
+	tm = time.Now()
+
+	// Add whitelisted environment variables to tags
+	// TODO: we still need this, right?
+	if len(d.TagEnvironment) > 0 {
+		for _, envvar := range info.Config.Env {
+			for _, configvar := range d.TagEnvironment {
+				dockEnv := strings.SplitN(envvar, "=", 2)
+				//check for presence of tag in whitelist
+				if len(dockEnv) == 2 && len(strings.TrimSpace(dockEnv[1])) != 0 && configvar == dockEnv[0] {
+					tags[dockEnv[0]] = dockEnv[1]
+				}
+			}
+		}
+	}
+
+	// TODO: Don't just magically pull from the map? See memstats in parseContainerStats()
+	mergedDir := containerDesc.GraphDriver.Data["MergedDir"]
+
+	size_fields  := map[string]interface{}{
+		"container_id": container.ID,
+		"size_root_fs": container.SizeRootFs,
+		"size_container_merged": d.calcSizeOfPath(mergedDir)
+	}
+
+	acc.addFields("docker_container_size", size_fields, tags, tm)
+
+	return nil
+}
+
+// TODO: I feel like this is unoptimized
+func (d *DockerOverlay2) calcSizeOfPath(currPath string) int64 {
+	var size int64
+
+	dir, err := os.Open(currPath)
+	if err != nil {
+		fmt.Println(err) // TODO: changeme?
+		return size
+	}
+	defer dir.Close()
+
+	files, err := dir.Readdir(-1)
+	if err != nil {
+		fmt.Println(err) // TODO: changeme?
+		return size
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			size += calcSizeOfPath(fmt.Sprintf("%s/%s", currPath, file.Name()))
+		} else {
+			size += file.Size()
+		}
+	}
+
+	return size
+}
+
+func (d *DockerOverlay2) createLabelFilters() error {
+	filter, err := filter.NewIncludeExcludeFilter(d.LabelInclude, d.LabelExclude)
+	if err != nil {
+		return err
+	}
+	d.labelFilter = filter
+	return nil
+}
+
+func (d *DockerOverlay2) createContainerStateFilters() error {
+	if len(d.ContainerStateInclude) == 0 && len(d.ContainerStateExclude) == 0 {
+		d.ContainerStateInclude = []string{"running"}
+	}
+	filter, err := filter.NewIncludeExcludeFilter(d.ContainerStateInclude, d.ContainerStateExclude)
+	if err != nil {
+		return err
+	}
+	d.stateFilter = filter
+	return nil
+}
+
+func (d *DockerOverlay2) getNewClient() (Client, error) {
+	if d.Endpoint == "ENV" {
+		return d.newEnvClient()
+	}
+
+	tlsConfig, err := d.ClientConfig.TLSConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	return d.newClient(d.Endpoint, tlsConfig)
+}
+
+func init() {
+	inputs.Add("docker_overlay2", func() telegraf.Input {
+		return &DockerOverlay2{
+			Timeout:        internal.Duration{Duration: time.Second * 5},
+			Endpoint:       defaultEndpoint,
+			newEnvClient:   NewEnvClient,
+			newClient:      NewClient,
+			filtersCreated: false,
+		}
+	})
+}
