@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -248,7 +249,7 @@ func (d *DockerOverlay2) gatherContainer(
 	size_fields := map[string]interface{}{
 		"container_id":          container.ID,
 		"size_root_fs":          container.SizeRootFs,
-		"size_container_merged": d.calcSizeOfPath(mergedDir),
+		"size_container_merged": d.pathSizeWalk(mergedDir),
 	}
 
 	acc.AddFields("docker_container_size", size_fields, tags, tm)
@@ -282,6 +283,25 @@ func (d *DockerOverlay2) calcSizeOfPath(currPath string) int64 {
 	}
 
 	return size
+}
+
+// TODO: how to properly handle errors here
+func (d *DockerOverlay2) pathSizeWalk(path string) int64 {
+	var pathSize int64
+	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			fmt.Printf("Couldn't access path %q: %v\n", path, err) // a warning?
+		}
+		if !info.IsDir() {
+			pathSize = pathSize + info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Printf("error walking %v\n", err) // should "return"/throw this error. Maybe just don't handle it?
+	}
+
+	return pathSize
 }
 
 func (d *DockerOverlay2) createContainerFilters() error {
