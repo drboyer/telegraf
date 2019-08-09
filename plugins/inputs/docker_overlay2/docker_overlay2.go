@@ -247,12 +247,32 @@ func (d *DockerOverlay2) gatherContainer(
 	mergedDir := insp.GraphDriver.Data["MergedDir"]
 
 	size_fields := map[string]interface{}{
-		"container_id":          container.ID,
-		"size_root_fs":          container.SizeRootFs,
-		"size_container_merged": d.pathSizeWalk(mergedDir),
+		"container_root_fs_size": container.SizeRootFs,
+		"container_merged_size":  d.pathSizeWalk(mergedDir),
 	}
 
-	acc.AddFields("docker_container_size", size_fields, tags, tm)
+	acc.AddFields("docker_overlay2", size_fields, tags, tm)
+
+	// TODO: hide behind a config option
+	// TODO: we want the volume names if they exist too
+	// TODO: break this out into a function/goroutine
+	// volumeMountSources := make([]string, 0)
+	for _, mount := range insp.Mounts {
+		if mount.Type == "volume" && len(mount.Source) > 0 { // TODO: is the second check necessary?
+			volTm := time.Now()
+			volumeTags := tags // TODO: copy?
+			volumeTags["volume_name"] = mount.Name
+			volumeTags["volume_source"] = mount.Source
+			volumeTags["volume_dest"] = mount.Destination
+			volumeTags["volume_driver"] = mount.Driver
+
+			fields := map[string]interface{}{
+				"size": d.pathSizeWalk(mount.Source),
+			}
+
+			acc.AddFields("docker_overlay2_container_volume", fields, volumeTags, volTm)
+		}
+	}
 
 	return nil
 }
