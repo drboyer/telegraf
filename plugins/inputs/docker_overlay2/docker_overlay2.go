@@ -37,6 +37,8 @@ type DockerOverlay2 struct {
 	ContainerStateInclude []string `toml:"container_state_include"`
 	ContainerStateExclude []string `toml:"container_state_exclude"`
 
+	IncludeVolumes bool `toml:"include_volumes"`
+
 	tlsint.ClientConfig
 
 	newEnvClient func() (Client, error)
@@ -52,13 +54,11 @@ type DockerOverlay2 struct {
 	stateFilter     filter.Filter
 }
 
-// TODO: human-friendly sizes?
 const (
 	defaultEndpoint = "unix:///var/run/docker.sock"
 )
 
 var (
-	// TODO: sizeRegex?
 	containerStates = []string{"created", "restarting", "running", "removing", "paused", "exited", "dead"}
 	now             = time.Now
 )
@@ -98,6 +98,9 @@ var sampleConfig = `
   # tls_key = "/etc/telegraf/key.pem"
   ## Use TLS but skip chain & host verification
   # insecure_skip_verify = false
+
+  ## Whether to measure the size of volumes mounted to containers as well
+  include_volumes = true
 `
 
 // SampleConfig returns the default DockerOverlay2 TOML configuration
@@ -134,13 +137,6 @@ func (d *DockerOverlay2) Gather(acc telegraf.Accumulator) error {
 		}
 		d.filtersCreated = true
 	}
-
-	// Get daemon info
-	// TODO: We don't need this, do we?
-	// err := d.gatherInfo(acc)
-	// if err != nil {
-	// 	acc.AddError(err)
-	// }
 
 	filterArgs := filters.NewArgs()
 	for _, state := range containerStates {
@@ -188,7 +184,6 @@ func (d *DockerOverlay2) Gather(acc telegraf.Accumulator) error {
 func (d *DockerOverlay2) gatherContainer(
 	container types.Container,
 	acc telegraf.Accumulator) error {
-	// var v *types.StatsJSON // TODO: unfortunately needed?
 
 	// Parse container name
 	var cname string
@@ -253,25 +248,35 @@ func (d *DockerOverlay2) gatherContainer(
 
 	acc.AddFields("docker_overlay2", size_fields, tags, tm)
 
-	// TODO: hide behind a config option
-	// TODO: we want the volume names if they exist too
-	// TODO: break this out into a function/goroutine
-	// volumeMountSources := make([]string, 0)
-	for _, mount := range insp.Mounts {
-		if mount.Type == "volume" && len(mount.Source) > 0 { // TODO: is the second check necessary?
-			volTm := time.Now()
-			volumeTags := tags // TODO: copy?
-			volumeTags["volume_name"] = mount.Name
-			volumeTags["volume_source"] = mount.Source
-			volumeTags["volume_dest"] = mount.Destination
-			volumeTags["volume_driver"] = mount.Driver
-
-			fields := map[string]interface{}{
-				"size": d.pathSizeWalk(mount.Source),
-			}
-
-			acc.AddFields("docker_overlay2_container_volume", fields, volumeTags, volTm)
+	if d.IncludeVolumes {
+		var wg sync.WaitGroup
+		wg.Add(len(insp.Mounts))
+		for _, mount := range insp.Mounts {
+			go func(mp types.MountPoint) {
+				defer wg.Done()
+				d.gatherVolumeMounts(mp, tags, acc)
+			}(mount)
 		}
+		wg.Wait()
+	}
+
+	return nil
+}
+
+func (d *DockerOverlay2) gatherVolumeMounts(mp types.MountPoint, tags map[string]string, acc telegraf.Accumulator) error {
+	if mp.Type == "volume" {
+		volTm := time.Now()
+		// volumeTags := tags
+		tags["volume_name"] = mp.Name
+		tags["volume_source"] = mp.Source
+		tags["volume_dest"] = mp.Destination
+		tags["volume_driver"] = mp.Driver
+
+		fields := map[string]interface{}{
+			"size": d.pathSizeWalk(mp.Source),
+		}
+
+		acc.AddFields("docker_overlay2_container_volume", fields, tags, volTm)
 	}
 
 	return nil
